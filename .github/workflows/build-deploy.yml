@@ -1,0 +1,80 @@
+name: Build and Deploy Juice Shop
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  RESOURCE_GROUP: rg-juiceshop-security-demo
+  AKS_NAME: aks-juiceshop-demo
+  ACR_NAME: acrht2ciqqdyaxmmjuice
+  ACR_LOGIN_SERVER: acrht2ciqqdyaxmmjuice.azurecr.io
+  IMAGE_NAME: juice-shop
+  NAMESPACE: juice-shop
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login with OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to ACR
+        run: |
+          az acr login --name $ACR_NAME
+
+      - name: Build Container Image
+        run: |
+          docker build \
+            --label org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" \
+            --label org.opencontainers.image.revision="${GITHUB_SHA}" \
+            -t $ACR_LOGIN_SERVER/$IMAGE_NAME:${GITHUB_SHA} \
+            .
+
+      - name: Push Container Image
+        run: |
+          docker push \
+            $ACR_LOGIN_SERVER/$IMAGE_NAME:${GITHUB_SHA}
+
+      - name: Get AKS Credentials
+        run: |
+          az aks get-credentials \
+            --resource-group $RESOURCE_GROUP \
+            --name $AKS_NAME \
+            --overwrite-existing
+
+      - name: Create Namespace
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+
+      - name: Deploy Juice Shop
+        run: |
+          sed \
+            "s|IMAGE_PLACEHOLDER|$ACR_LOGIN_SERVER/$IMAGE_NAME:${GITHUB_SHA}|g" \
+            k8s/deployment.yaml \
+            | kubectl apply -f -
+
+          kubectl apply -f k8s/service.yaml
+
+      - name: Wait for Deployment
+        run: |
+          kubectl rollout status \
+            deployment/juice-shop \
+            -n $NAMESPACE \
+            --timeout=300s
+
+      - name: Show Deployment
+        run: |
+          kubectl get pods -n $NAMESPACE
+          kubectl get services -n $NAMESPACE

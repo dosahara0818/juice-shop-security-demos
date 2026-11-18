@@ -1,0 +1,84 @@
+name: Generate Juice Shop SPDX SBOM
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+env:
+  ACR_NAME: acrht2ciqqdyaxmmjuice
+  IMAGE: acrht2ciqqdyaxmmjuice.azurecr.io/juice-shop:b21ac9200cc5458754ed814e752e204d5b581fa7
+
+jobs:
+  generate-sbom:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login with OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Pull existing image from ACR
+        run: |
+          set -euo pipefail
+          az acr login --name "$ACR_NAME"
+          docker pull "$IMAGE"
+          docker image inspect "$IMAGE" --format '{{json .RepoDigests}}'
+
+      - name: Download Defender CLI
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 \
+            https://aka.ms/defender-cli_linux-x64 \
+            --output "$RUNNER_TEMP/defender"
+          chmod +x "$RUNNER_TEMP/defender"
+          "$RUNNER_TEMP/defender" --version
+
+      - name: Generate SPDX 2.3 SBOM with Defender CLI
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sbom-output"
+          "$RUNNER_TEMP/defender" scan sbom "$IMAGE" \
+            --scanner mdvmsbom \
+            --sbom-format spdx2.3-json \
+            --output "$RUNNER_TEMP/sbom-output/juice-shop.spdx.json" \
+            --defender-output "$RUNNER_TEMP/sbom-output/juice-shop.sarif"
+
+      - name: Validate SPDX document
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["RUNNER_TEMP"]) / "sbom-output/juice-shop.spdx.json"
+          with path.open(encoding="utf-8-sig") as stream:
+              document = json.load(stream)
+          assert document.get("spdxVersion") == "SPDX-2.3", "Expected SPDX 2.3"
+          assert document.get("SPDXID") == "SPDXRef-DOCUMENT", "Missing document SPDXID"
+          assert document.get("documentNamespace"), "Missing document namespace"
+          assert document.get("dataLicense") == "CC0-1.0", "Unexpected data license"
+          packages = document.get("packages")
+          assert isinstance(packages, list) and packages, "No packages in SBOM"
+          print(f"Validated SPDX 2.3 SBOM: {len(packages)} packages, {path.stat().st_size} bytes")
+          PY
+
+      - name: Save validated SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: juice-shop-spdx-2.3
+          path: ${{ runner.temp }}/sbom-output/juice-shop.spdx.json
+          if-no-files-found: error
+          retention-days: 1
